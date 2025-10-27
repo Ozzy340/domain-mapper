@@ -40,6 +40,7 @@ import argparse
 import asyncio
 import csv
 import sys
+import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -68,6 +69,47 @@ class Row:
     destination_url: str
     pointing_to_count: int
     points_to_list_domain: bool
+
+
+def format_hhmmss(total_seconds: float) -> str:
+    seconds = max(0, int(total_seconds))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    if hours > 99:
+        hours = 99
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def build_progress_bar(completed: int, total: int, width: int = 30) -> str:
+    if total <= 0:
+        return "[{}]".format("." * width)
+    if completed >= total:
+        return "[{}]".format("=" * width)
+    filled = int(width * (completed / total))
+    filled = min(filled, width - 1)
+    return "[{}>{}]".format("=" * filled, "." * (width - filled - 1))
+
+
+def truncate_label(label: str, max_len: int = 40) -> str:
+    label = label or ""
+    if len(label) <= max_len:
+        return label
+    return label[: max_len - 1] + "…"
+
+
+def render_progress_line(completed: int, total: int, elapsed_s: float, current_label: str) -> str:
+    percent = 0.0 if total == 0 else (completed / total) * 100.0
+    avg = 0.0 if completed == 0 else (elapsed_s / completed)
+    eta_s = avg * max(0, total - completed)
+    bar = build_progress_bar(completed, total)
+    elapsed_txt = format_hhmmss(elapsed_s)
+    eta_txt = format_hhmmss(eta_s)
+    label = truncate_label(current_label, 40)
+    return (
+        f"{bar} {completed:>4}/{total:<4} {percent:5.1f}% "
+        f"elapsed {elapsed_txt} eta {eta_txt} | current: {label}"
+    )
 
 
 def ensure_url_scheme(raw: str) -> Tuple[str, str]:
@@ -245,6 +287,9 @@ async def main():
         print("No URLs found in input CSV.", file=sys.stderr)
         sys.exit(2)
 
+    total_urls = len(urls)
+    print(f"Found {total_urls} domain(s) to process.")
+
     try:
         from playwright.async_api import async_playwright  # type: ignore
     except ImportError:
@@ -261,12 +306,22 @@ async def main():
             java_script_enabled=True,
         )
         # Sequential processing
+        start_time = time.time()
         for i, raw in enumerate(urls, 1):
-            print(f"[{i}/{len(urls)}] Resolving {raw} ...", flush=True)
+            # Render progress
+            elapsed = time.time() - start_time
+            progress_line = render_progress_line(i - 1, total_urls, elapsed, f"{raw}")
+            sys.stdout.write("\r" + progress_line)
+            sys.stdout.flush()
             final_url = await process_one(context, raw, args.timeout, args.js_settle)
             if not final_url:
                 final_url = ""
             destinations.append(final_url)
+        # Final 100% progress update
+        elapsed = time.time() - start_time
+        final_line = render_progress_line(total_urls, total_urls, elapsed, "done")
+        sys.stdout.write("\r" + final_line + "\n")
+        sys.stdout.flush()
         await context.close()
         await browser.close()
 
@@ -283,7 +338,8 @@ async def main():
     # Summary
     total = len(rows)
     in_list = sum(1 for r in rows if r.points_to_list_domain)
-    print(f"\nDone. Wrote {total} rows to {out_path}.")
+    abs_out = out_path.resolve()
+    print(f"\nDone. Processed {total_urls} domain(s). Wrote {total} rows to {abs_out}.")
     print(f"{in_list} source(s) point to a domain in the input list (by registrable match).")
 
 
