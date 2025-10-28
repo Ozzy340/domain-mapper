@@ -13,6 +13,7 @@ Output columns:
 - destination_url
 - pointing_to_count  (how many *input* domains point to this destination domain)
 - points_to_list_domain (True/False)
+ - dom_size_chars (character length of the page's HTML at settle time)
 
 By default, counting is done at the *registrable domain* level (e.g.,
 sub.example.co.uk -> example.co.uk). You can change this to count by full host
@@ -70,6 +71,7 @@ class Row:
     destination_url: str
     pointing_to_count: int
     points_to_list_domain: bool
+    dom_size_chars: int
 
 
 def format_hhmmss(total_seconds: float) -> str:
@@ -132,7 +134,7 @@ def ensure_url_scheme(raw: str) -> Tuple[str, str]:
     return f"https://{raw}", f"http://{raw}"
 
 
-async def resolve_final_url(page, start_url: str, timeout_ms: int, js_settle_ms: int) -> str:
+async def resolve_final_url(page, start_url: str, timeout_ms: int, js_settle_ms: int) -> Tuple[str, int]:
     """Navigate to start_url and try to capture the final URL after redirects.
 
     We wait for 'networkidle', then give a small window for JS redirects
@@ -158,30 +160,45 @@ async def resolve_final_url(page, start_url: str, timeout_ms: int, js_settle_ms:
                 # Reset small window to catch cascading redirects
                 remaining = min(js_settle_ms, remaining + 2 * step)
             remaining -= step
-    return final_url
+    # Compute DOM size after settle
+    dom_size_chars = 0
+    try:
+        dom_size_chars = await page.evaluate(
+            "() => document && document.documentElement ? document.documentElement.outerHTML.length : (document && document.body ? document.body.outerHTML.length : 0)"
+        )
+    except Exception:
+        try:
+            html = await page.content()
+            dom_size_chars = len(html)
+        except Exception:
+            dom_size_chars = 0
+    return final_url, int(dom_size_chars)
 
 
-async def process_one(context, raw: str, timeout_ms: int, js_settle_ms: int) -> str:
+async def process_one(context, raw: str, timeout_ms: int, js_settle_ms: int) -> Tuple[str, int]:
     """Return the final resolved URL for the given raw url/domain.
     Tries HTTPS first, then HTTP.
     """
     https_url, http_url = ensure_url_scheme(raw)
     page = await context.new_page()
     final_url = ""
+    dom_size_chars = 0
     try:
-        final_url = await resolve_final_url(page, https_url, timeout_ms, js_settle_ms)
+        final_url, dom_size_chars = await resolve_final_url(page, https_url, timeout_ms, js_settle_ms)
     except Exception:
         # Try HTTP fallback if HTTPS path failed and wasn't already HTTP
         if https_url != http_url:
             try:
-                final_url = await resolve_final_url(page, http_url, timeout_ms, js_settle_ms)
+                final_url, dom_size_chars = await resolve_final_url(page, http_url, timeout_ms, js_settle_ms)
             except Exception:
                 final_url = ""
+                dom_size_chars = 0
         else:
             final_url = ""
+            dom_size_chars = 0
     finally:
         await page.close()
-    return final_url
+    return final_url, dom_size_chars
 
 
 def read_input_csv(path: Path) -> List[str]:
@@ -248,6 +265,7 @@ def hostname_from_url(u: str) -> str:
 def build_counts(
     sources: List[str],
     destinations: List[str],
+    dom_sizes: List[int],
     count_by: str,
 ) -> Tuple[List[Row], Dict[str, int]]:
     """Create output rows and a map of destination-domain -> inbound count.
@@ -276,7 +294,7 @@ def build_counts(
 
     # Build rows, including points_to_list_domain flag based on registrable match
     rows: List[Row] = []
-    for src, dest, key in zip(sources, destinations, dest_keys):
+    for src, dest, key, dom_size in zip(sources, destinations, dest_keys, dom_sizes):
         dest_host = hostname_from_url(dest).lower() if dest else ""
         dest_reg = registrable_domain(dest_host) if dest_host else ""
         points_to_list = dest_reg in input_regs if dest_reg else False
@@ -286,6 +304,7 @@ def build_counts(
             destination_url=dest,
             pointing_to_count=count,
             points_to_list_domain=points_to_list,
+            dom_size_chars=int(dom_size or 0),
         ))
     return rows, inbound
 
@@ -317,6 +336,7 @@ async def main():
         sys.exit(3)
 
     destinations: List[str] = []
+    dom_sizes: List[int] = []
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
@@ -339,10 +359,11 @@ async def main():
                 # Non-TTY: print a clean line to avoid stray carriage returns
                 print(progress_line)
 
-            final_url = await process_one(context, raw, args.timeout, args.js_settle)
+            final_url, dom_size_chars = await process_one(context, raw, args.timeout, args.js_settle)
             if not final_url:
                 final_url = ""
             destinations.append(final_url)
+            dom_sizes.append(int(dom_size_chars or 0))
 
             # Per-domain result line with full final URL (scheme included)
             if is_tty:
@@ -359,12 +380,12 @@ async def main():
         await context.close()
         await browser.close()
 
-    rows, inbound = build_counts(urls, destinations, args.count_by)
+    rows, inbound = build_counts(urls, destinations, dom_sizes, args.count_by)
 
     # Write CSV
     out_path: Path = args.output_csv
     with out_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["source_url", "destination_url", "pointing_to_count", "points_to_list_domain"])
+        writer = csv.DictWriter(f, fieldnames=["source_url", "destination_url", "pointing_to_count", "points_to_list_domain", "dom_size_chars"])
         writer.writeheader()
         for r in rows:
             writer.writerow(asdict(r))

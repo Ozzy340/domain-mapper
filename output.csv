@@ -1,2 +1,2 @@
-source_url,destination_url,pointing_to_count,points_to_list_domain
-quadient.com,https://www.quadient.com/,1,True
+source_url,destination_url,pointing_to_count,points_to_list_domain,dom_size_chars
+quadient.com,https://www.quadient.com/,1,True,1480891
