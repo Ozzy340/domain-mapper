@@ -41,6 +41,7 @@ import asyncio
 import csv
 import sys
 import time
+import io
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -95,7 +96,12 @@ def truncate_label(label: str, max_len: int = 40) -> str:
     label = label or ""
     if len(label) <= max_len:
         return label
-    return label[: max_len - 1] + "…"
+    # Preserve both start and end so TLDs/suffixes remain visible
+    if max_len <= 6:
+        return label[: max_len]
+    prefix_len = (max_len - 3) // 2
+    suffix_len = max_len - 3 - prefix_len
+    return label[:prefix_len] + "..." + label[-suffix_len:]
 
 
 def render_progress_line(completed: int, total: int, elapsed_s: float, current_label: str) -> str:
@@ -180,37 +186,51 @@ async def process_one(context, raw: str, timeout_ms: int, js_settle_ms: int) -> 
 
 def read_input_csv(path: Path) -> List[str]:
     urls: List[str] = []
-    with path.open(newline="", encoding="utf-8") as f:
-        sniffer = csv.Sniffer()
-        sample = f.read(2048)
-        f.seek(0)
-        try:
-            dialect = sniffer.sniff(sample)
-        except Exception:
-            dialect = csv.excel
-        reader = csv.reader(f, dialect)
-        rows = list(reader)
-        if not rows:
-            return urls
-        header_like = [c.strip().lower() for c in rows[0]]
-        start_idx = 1
+    text = path.read_text(encoding="utf-8")
+    text = text.lstrip("\ufeff")  # strip BOM if present
+
+    # Try robust CSV parsing with restricted delimiters to avoid breaking on ':' in http://
+    sniffer = csv.Sniffer()
+    sample = text[:2048]
+    try:
+        dialect = sniffer.sniff(sample, delimiters=",;\t|")
+    except Exception:
+        dialect = csv.excel
+
+    reader = csv.reader(io.StringIO(text), dialect)
+    rows = list(reader)
+
+    # Fallback: if it looks like the first row was split into characters, treat as plain lines
+    if rows and len(rows[0]) > 1 and all(len(cell) == 1 for cell in rows[0]):
+        lines = [ln.strip() for ln in text.splitlines()]
+        lines = [ln for ln in lines if ln]
+        if lines and lines[0].strip().lower() in ("url", "domain"):
+            lines = lines[1:]
+        return lines
+
+    if not rows:
+        return urls
+
+    header_like = [c.strip().lower() for c in rows[0]]
+    start_idx = 1
+    col_idx = 0
+    if any(h in ("url", "domain") for h in header_like):
+        # Choose first matching header column
+        for i, h in enumerate(header_like):
+            if h in ("url", "domain"):
+                col_idx = i
+                break
+    else:
+        # No header; start from first row
+        start_idx = 0
         col_idx = 0
-        if any(h in ("url", "domain") for h in header_like):
-            # Choose first matching header column
-            for i, h in enumerate(header_like):
-                if h in ("url", "domain"):
-                    col_idx = i
-                    break
-        else:
-            # No header; start from first row
-            start_idx = 0
-            col_idx = 0
-        for r in rows[start_idx:]:
-            if not r:
-                continue
-            cell = (r[col_idx] if col_idx < len(r) else "").strip()
-            if cell:
-                urls.append(cell)
+
+    for r in rows[start_idx:]:
+        if not r:
+            continue
+        cell = (r[col_idx] if col_idx < len(r) else "").strip()
+        if cell:
+            urls.append(cell)
     return urls
 
 
@@ -307,21 +327,35 @@ async def main():
         )
         # Sequential processing
         start_time = time.time()
+        is_tty = sys.stdout.isatty()
         for i, raw in enumerate(urls, 1):
             # Render progress
             elapsed = time.time() - start_time
             progress_line = render_progress_line(i - 1, total_urls, elapsed, f"{raw}")
-            sys.stdout.write("\r" + progress_line)
-            sys.stdout.flush()
+            if is_tty:
+                sys.stdout.write("\r" + progress_line)
+                sys.stdout.flush()
+            else:
+                # Non-TTY: print a clean line to avoid stray carriage returns
+                print(progress_line)
+
             final_url = await process_one(context, raw, args.timeout, args.js_settle)
             if not final_url:
                 final_url = ""
             destinations.append(final_url)
-        # Final 100% progress update
-        elapsed = time.time() - start_time
-        final_line = render_progress_line(total_urls, total_urls, elapsed, "done")
-        sys.stdout.write("\r" + final_line + "\n")
-        sys.stdout.flush()
+
+            # Per-domain result line with full final URL (scheme included)
+            if is_tty:
+                sys.stdout.write("\r" + (" " * max(len(progress_line), 80)) + "\r")
+                sys.stdout.flush()
+            print(f"[{i}/{total_urls}] input: {raw} -> final: {final_url}")
+
+        # Final 100% progress update for TTY only
+        if is_tty:
+            elapsed = time.time() - start_time
+            final_line = render_progress_line(total_urls, total_urls, elapsed, "done")
+            sys.stdout.write("\r" + final_line + "\n")
+            sys.stdout.flush()
         await context.close()
         await browser.close()
 
